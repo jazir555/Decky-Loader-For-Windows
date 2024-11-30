@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import sys
 import time
+import PyInstaller
 
 class DeckyBuilder:
     def __init__(self, release: str):
@@ -90,93 +91,91 @@ class DeckyBuilder:
 
     def clone_repository(self):
         """Clone Decky Loader repository"""
-        print("Cloning repository with release {}...".format(self.release))
-        subprocess.run([
-            "git", "clone",
-            "--branch", self.release,
-            "https://github.com/SteamDeckHomebrew/decky-loader.git",
-            str(self.app_dir)
-        ], check=True)
+        print("Cloning repository with release", self.release)
+        if os.path.exists(self.app_dir):
+            shutil.rmtree(self.app_dir)
+        
+        # Clone the repository
+        subprocess.run(['git', 'clone', 'https://github.com/SteamDeckHomebrew/decky-loader.git', self.app_dir], check=True)
+        os.chdir(self.app_dir)
+        
+        # If release is 'main', try to get the latest tag
+        if self.release == 'main':
+            try:
+                # Get the latest tag
+                result = subprocess.run(['git', 'describe', '--tags', '--abbrev=0'], 
+                                     capture_output=True, text=True, check=True)
+                self.release = result.stdout.strip()
+                print(f"Using latest tag: {self.release}")
+            except subprocess.CalledProcessError:
+                print("Warning: Could not get latest tag, using 'main'")
+        
+        # Checkout the specified release
+        subprocess.run(['git', 'checkout', self.release], check=True)
+        os.chdir(self.root_dir)
 
     def build_frontend(self):
         """Build frontend files"""
         print("Building frontend...")
         try:
             frontend_dir = self.app_dir / "frontend"
-            if frontend_dir.exists():
-                # Install dependencies and build using shell=True
-                print("Installing frontend dependencies...")
-                subprocess.run("pnpm i", shell=True, cwd=frontend_dir, check=True)
-                
-                print("Building frontend...")
-                subprocess.run("pnpm run build", shell=True, cwd=frontend_dir, check=True)
-                
-                # Create .loader.version
-                with open(frontend_dir / ".loader.version", "w") as f:
-                    f.write(self.release)
-                    
-                print("Frontend build completed successfully")
-            else:
-                raise Exception("Frontend directory not found")
+            os.chdir(frontend_dir)
+
+            # Create .loader.version file with the release tag
+            with open(".loader.version", "w") as f:
+                f.write(self.release)
+
+            # Install dependencies and build
+            subprocess.run(["pnpm", "i"], check=True)
+            subprocess.run(["pnpm", "run", "build"], check=True)
+
+            # Return to original directory
+            os.chdir(self.root_dir)
         except Exception as e:
             print(f"Error building frontend: {str(e)}")
             raise
 
     def prepare_backend(self):
-        """Prepare backend files for PyInstaller"""
+        """Prepare backend files for building."""
         print("Preparing backend files...")
-        try:
-            # Create dist directory first
-            (self.src_dir / "dist").mkdir(parents=True, exist_ok=True)
-            
-            print("Copying files according to Dockerfile structure...")
-            
-            # Copy backend directory contents
-            backend_dir = self.app_dir / "backend"
-            if backend_dir.exists():
-                print("Copying backend files...")
-                
-                # Copy main.py to src directory
-                shutil.copy2(backend_dir / "main.py", self.src_dir / "main.py")
-                
-                # Copy decky_loader package
-                decky_loader_src = backend_dir / "decky_loader"
-                if decky_loader_src.exists():
-                    decky_loader_dest = self.src_dir / "decky_loader"
-                    if decky_loader_dest.exists():
-                        shutil.rmtree(decky_loader_dest)
-                    shutil.copytree(decky_loader_src, decky_loader_dest)
-                else:
-                    raise Exception("decky_loader directory not found in backend")
+        print("Copying files according to Dockerfile structure...")
 
-                # Copy frontend static files
-                frontend_dir = self.app_dir / "frontend" / "dist"
-                if frontend_dir.exists():
-                    static_dest = self.src_dir / "static"
-                    if static_dest.exists():
-                        shutil.rmtree(static_dest)
-                    shutil.copytree(frontend_dir, static_dest)
+        # Create src directory if it doesn't exist
+        os.makedirs(self.src_dir, exist_ok=True)
 
-                # Copy plugin directory
-                plugin_src = self.app_dir / "plugin"
-                if plugin_src.exists():
-                    plugin_dest = self.src_dir / "plugin"
-                    if plugin_dest.exists():
-                        shutil.rmtree(plugin_dest)
-                    shutil.copytree(plugin_src, plugin_dest)
-            else:
-                raise Exception("Backend directory not found")
-            
-            # Create .loader.version file
-            print("Creating .loader.version...")
-            with open(self.src_dir / "dist" / ".loader.version", "w") as f:
-                f.write(self.release)
-            
-            print("Backend preparation completed successfully!")
-            
-        except Exception as e:
-            print(f"Error during backend preparation: {str(e)}")
-            raise
+        # Copy backend files from app/backend/decky_loader to src/decky_loader
+        print("Copying backend files...")
+        shutil.copytree(os.path.join(self.app_dir, "backend", "decky_loader"), 
+                       os.path.join(self.src_dir, "decky_loader"), 
+                       dirs_exist_ok=True)
+
+        # Copy static, locales, and plugin directories to maintain decky_loader structure
+        os.makedirs(os.path.join(self.src_dir, "decky_loader"), exist_ok=True)
+        shutil.copytree(os.path.join(self.app_dir, "backend", "decky_loader", "static"),
+                       os.path.join(self.src_dir, "decky_loader", "static"),
+                       dirs_exist_ok=True)
+        shutil.copytree(os.path.join(self.app_dir, "backend", "decky_loader", "locales"),
+                       os.path.join(self.src_dir, "decky_loader", "locales"),
+                       dirs_exist_ok=True)
+        shutil.copytree(os.path.join(self.app_dir, "backend", "decky_loader", "plugin"),
+                       os.path.join(self.src_dir, "decky_loader", "plugin"),
+                       dirs_exist_ok=True)
+
+        # Create legacy directory
+        os.makedirs(os.path.join(self.src_dir, "src", "legacy"), exist_ok=True)
+
+        # Copy main.py to src directory
+        shutil.copy2(os.path.join(self.app_dir, "backend", "main.py"),
+                    os.path.join(self.src_dir, "main.py"))
+
+        # Create .loader.version file in src/dist
+        print("Creating .loader.version...")
+        os.makedirs(os.path.join(self.src_dir, "dist"), exist_ok=True)
+        shutil.copy2(os.path.join(self.app_dir, "frontend", ".loader.version"),
+                    os.path.join(self.src_dir, "dist", ".loader.version"))
+
+        print("Backend preparation completed successfully!")
+        return True
 
     def install_requirements(self):
         """Install Python requirements"""
@@ -206,68 +205,87 @@ class DeckyBuilder:
     def build_executables(self):
         """Build executables using PyInstaller"""
         print("Building executables...")
+        print("Current directory contents:")
+        for path in Path(self.src_dir).rglob("*"):
+            print(f"  {path}")
+
+        # Build console version
+        print("Building console version...")
         try:
-            # Common PyInstaller arguments
-            pyinstaller_args = [
-                "--noconfirm",
-                "--onefile",
-                "--name", "PluginLoader",
-                "--add-data", f"{self.src_dir / 'decky_loader/static'};decky_loader/static",
-                "--add-data", f"{self.src_dir / 'decky_loader/locales'};decky_loader/locales",
-                "--add-data", f"{self.src_dir / 'decky_loader/plugin'};decky_loader/plugin",
-                "--hidden-import=logging.handlers",
-                "--hidden-import=sqlite3",
-                str(self.src_dir / "main.py")
-            ]
-            
-            # Print directory contents for debugging
-            print("Current directory contents:")
-            for path in self.src_dir.rglob("*"):
-                print(f"  {path}")
-            
-            print("Building console version...")
-            subprocess.run(["pyinstaller"] + pyinstaller_args, check=True)
-            
-            print("Building no-console version...")
-            subprocess.run(["pyinstaller", "--noconsole"] + pyinstaller_args, check=True)
-            
+            subprocess.run([
+                'pyinstaller',
+                '--noconfirm',
+                '--onefile',
+                '--name', 'PluginLoader',
+                '--add-data', 'decky_loader/static;decky_loader/static',
+                '--add-data', 'decky_loader/locales;decky_loader/locales',
+                '--add-data', 'src/legacy;src/legacy',
+                '--add-data', 'decky_loader/plugin;decky_loader/plugin',
+                '--hidden-import', 'logging.handlers',
+                '--hidden-import', 'sqlite3',
+                'main.py'
+            ], check=True, cwd=self.src_dir)
         except subprocess.CalledProcessError as e:
-            print(f"Error building executables: {e}")
-            raise
+            print(f"Error during build process: {e}")
+            return False
+
+        # Build no-console version
+        print("Building no-console version...")
+        try:
+            subprocess.run([
+                'pyinstaller',
+                '--noconfirm',
+                '--onefile',
+                '--noconsole',
+                '--name', 'PluginLoader_noconsole',
+                '--add-data', 'decky_loader/static;decky_loader/static',
+                '--add-data', 'decky_loader/locales;decky_loader/locales',
+                '--add-data', 'src/legacy;src/legacy',
+                '--add-data', 'decky_loader/plugin;decky_loader/plugin',
+                '--hidden-import', 'logging.handlers',
+                '--hidden-import', 'sqlite3',
+                'main.py'
+            ], check=True, cwd=self.src_dir)
+        except subprocess.CalledProcessError as e:
+            print(f"Error during build process: {e}")
+            return False
+
+        # Create required directories
+        services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
+        logs_dir = os.path.join(os.path.expanduser("~"), "homebrew", "logs")
+        os.makedirs(services_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # Copy executables to homebrew directory
+        print("Copying files to homebrew directory...")
+        shutil.copy2(
+            os.path.join(self.src_dir, "dist", "PluginLoader.exe"),
+            os.path.join(services_dir, "plugin_loader.exe")
+        )
+        shutil.copy2(
+            os.path.join(self.src_dir, "dist", "PluginLoader_noconsole.exe"),
+            os.path.join(services_dir, "plugin_loader_noconsole.exe")
+        )
+
+        return True
 
     def copy_to_homebrew(self):
         """Copy all necessary files to the homebrew directory"""
         print("Copying files to homebrew directory...")
-        services_dir = self.homebrew_dir / "services"
-        user_services_dir = self.user_homebrew_dir / "services"
-        
-        # Copy executables from dist directory (matching Dockerfile)
-        exe_extension = ".exe" if os.name == 'nt' else ""
         try:
-            # Create services directory if it doesn't exist
-            services_dir.mkdir(parents=True, exist_ok=True)
-            user_services_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Copy the built executables to both locations
-            plugin_loader_exe = self.root_dir / "dist" / f"PluginLoader{exe_extension}"
-            if plugin_loader_exe.exists():
-                shutil.copy2(plugin_loader_exe, services_dir / f"plugin_loader{exe_extension}")
-                shutil.copy2(plugin_loader_exe, user_services_dir / f"plugin_loader{exe_extension}")
-            else:
-                raise FileNotFoundError(f"Built executable not found at: {plugin_loader_exe}")
-                
-            # Copy version file to both locations
-            version_file = self.src_dir / "dist" / ".loader.version"
-            if version_file.exists():
-                shutil.copy2(version_file, self.homebrew_dir / ".loader.version")
-                shutil.copy2(version_file, self.user_homebrew_dir / ".loader.version")
-            else:
-                raise FileNotFoundError(f"Version file not found at: {version_file}")
-            
-            print(f"Successfully copied files to: {self.user_homebrew_dir}")
-                
+            # Create homebrew directory if it doesn't exist
+            os.makedirs(self.homebrew_dir, exist_ok=True)
+
+            # Copy version file
+            version_file = os.path.join(self.src_dir, 'dist', '.loader.version')
+            if os.path.exists(version_file):
+                try:
+                    shutil.copy2(version_file, os.path.join(self.homebrew_dir, '.loader.version'))
+                except Exception as e:
+                    print(f"Warning: Failed to copy .loader.version: {str(e)}")
+
         except Exception as e:
-            print(f"Error during copy to homebrew: {e}")
+            print(f"Error during copy to homebrew: {str(e)}")
             raise
 
     def install_nodejs(self):
@@ -380,13 +398,6 @@ class DeckyBuilder:
                 subprocess.run("npm i -g pnpm", shell=True, check=True)
                 pnpm_version = subprocess.run("pnpm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
                 print(f"Installed pnpm version {pnpm_version}")
-
-            # Check Python
-            try:
-                python_version = subprocess.run("python --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                print(f"{python_version} is installed")
-            except:
-                raise Exception("Python is not installed. Please install Python 3.8 or later.")
 
             # Check git
             try:
