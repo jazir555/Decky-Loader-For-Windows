@@ -205,18 +205,24 @@ class DeckyBuilder:
     def build_executables(self):
         """Build executables using PyInstaller"""
         print("Building executables...")
-        print("Current directory contents:")
-        for path in Path(self.src_dir).rglob("*"):
-            print(f"  {path}")
-
-        # Build console version
-        print("Building console version...")
         try:
+            # Clean services directory first
+            services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
+            if os.path.exists(services_dir):
+                for item in os.listdir(services_dir):
+                    item_path = os.path.join(services_dir, item)
+                    if os.path.isfile(item_path):
+                        os.remove(item_path)
+                    elif os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+
+            # Build console version
             subprocess.run([
                 'pyinstaller',
-                '--noconfirm',
-                '--onefile',
+                '--clean',
                 '--name', 'PluginLoader',
+                '--onefile',
+                '--console',
                 '--add-data', 'decky_loader/static;decky_loader/static',
                 '--add-data', 'decky_loader/locales;decky_loader/locales',
                 '--add-data', 'src/legacy;src/legacy',
@@ -225,19 +231,14 @@ class DeckyBuilder:
                 '--hidden-import', 'sqlite3',
                 'main.py'
             ], check=True, cwd=self.src_dir)
-        except subprocess.CalledProcessError as e:
-            print(f"Error during build process: {e}")
-            return False
 
-        # Build no-console version
-        print("Building no-console version...")
-        try:
+            # Build no-console version
             subprocess.run([
                 'pyinstaller',
-                '--noconfirm',
+                '--clean',
+                '--name', 'PluginLoader_noconsole',
                 '--onefile',
                 '--noconsole',
-                '--name', 'PluginLoader_noconsole',
                 '--add-data', 'decky_loader/static;decky_loader/static',
                 '--add-data', 'decky_loader/locales;decky_loader/locales',
                 '--add-data', 'src/legacy;src/legacy',
@@ -246,28 +247,33 @@ class DeckyBuilder:
                 '--hidden-import', 'sqlite3',
                 'main.py'
             ], check=True, cwd=self.src_dir)
+
+            # Create required directories
+            services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
+            logs_dir = os.path.join(os.path.expanduser("~"), "homebrew", "logs")
+            os.makedirs(services_dir, exist_ok=True)
+            os.makedirs(logs_dir, exist_ok=True)
+
+            # Copy executables to homebrew directory
+            print("Copying executables to homebrew directory...")
+            shutil.copy2(
+                os.path.join(self.src_dir, "dist", "PluginLoader.exe"),
+                os.path.join(services_dir, "plugin_loader.exe")
+            )
+            shutil.copy2(
+                os.path.join(self.src_dir, "dist", "PluginLoader_noconsole.exe"),
+                os.path.join(services_dir, "PluginLoader_noconsole.exe")
+            )
+
+            # Create version file
+            version_file = os.path.join(services_dir, ".loader.version")
+            with open(version_file, "w") as f:
+                f.write(self.release)
+
+            return True
         except subprocess.CalledProcessError as e:
             print(f"Error during build process: {e}")
             return False
-
-        # Create required directories
-        services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
-        logs_dir = os.path.join(os.path.expanduser("~"), "homebrew", "logs")
-        os.makedirs(services_dir, exist_ok=True)
-        os.makedirs(logs_dir, exist_ok=True)
-
-        # Copy executables to homebrew directory
-        print("Copying files to homebrew directory...")
-        shutil.copy2(
-            os.path.join(self.src_dir, "dist", "PluginLoader.exe"),
-            os.path.join(services_dir, "plugin_loader.exe")
-        )
-        shutil.copy2(
-            os.path.join(self.src_dir, "dist", "PluginLoader_noconsole.exe"),
-            os.path.join(services_dir, "plugin_loader_noconsole.exe")
-        )
-
-        return True
 
     def copy_to_homebrew(self):
         """Copy all necessary files to the homebrew directory"""
@@ -276,13 +282,8 @@ class DeckyBuilder:
             # Create homebrew directory if it doesn't exist
             os.makedirs(self.homebrew_dir, exist_ok=True)
 
-            # Copy version file
-            version_file = os.path.join(self.src_dir, 'dist', '.loader.version')
-            if os.path.exists(version_file):
-                try:
-                    shutil.copy2(version_file, os.path.join(self.homebrew_dir, '.loader.version'))
-                except Exception as e:
-                    print(f"Warning: Failed to copy .loader.version: {str(e)}")
+            # We don't need to copy anything else since build_executables handles the file copying
+            pass
 
         except Exception as e:
             print(f"Error during copy to homebrew: {str(e)}")
@@ -460,26 +461,26 @@ class DeckyBuilder:
         """Setup PluginLoader to run at startup"""
         print("Setting up autostart...")
         try:
-            startup_folder = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-            plugin_loader = self.user_homebrew_dir / "services" / "PluginLoader_noconsole.exe"
+            # Get the path to the no-console executable
+            services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
+            plugin_loader = os.path.join(services_dir, "PluginLoader_noconsole.exe")
+
+            # Get the Windows Startup folder path
+            startup_folder = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
             
-            if plugin_loader.exists():
-                import pythoncom
-                from win32com.client import Dispatch
-                
-                shell = Dispatch("WScript.Shell")
-                shortcut_path = startup_folder / "PluginLoader.lnk"
-                shortcut = shell.CreateShortCut(str(shortcut_path))
-                shortcut.Targetpath = str(plugin_loader)
-                shortcut.WorkingDirectory = str(plugin_loader.parent)
-                shortcut.save()
-                print("Created autostart shortcut for PluginLoader")
-            else:
-                print("Warning: PluginLoader_noconsole.exe not found")
+            # Create a batch file in the startup folder
+            startup_bat = os.path.join(startup_folder, "start_decky.bat")
+            
+            # Write the batch file with proper path escaping
+            with open(startup_bat, "w") as f:
+                f.write(f'@echo off\n"{plugin_loader}"')
+
+            print(f"Created startup script at: {startup_bat}")
+            return True
 
         except Exception as e:
             print(f"Error setting up autostart: {str(e)}")
-            raise
+            return False
 
     def run(self):
         """Run the build process"""
@@ -496,7 +497,7 @@ class DeckyBuilder:
             self.copy_to_homebrew()
             self.setup_steam_config()
             self.setup_autostart()
-            print("Build process completed successfully!")
+            print("\nBuild process completed successfully\!")
             print("\nNext steps:")
             print("1. Close Steam if it's running")
             print("2. Launch Steam using the new shortcut on your desktop")
