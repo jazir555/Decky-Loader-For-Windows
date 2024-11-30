@@ -16,4 +16,4 @@ A Python-based installer and build system for Decky Loader on Windows. This tool
 - Internet connection for downloading dependencies
 
 ## Usage
-Simply run "install_decky.bat" and follow the prompts.
+Download files / zip, run "install_decky.bat" and follow the prompts.
