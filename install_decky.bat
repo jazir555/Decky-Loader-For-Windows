@@ -1,68 +1,90 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-echo Checking for Python installation...
-
-:: Define minimum required Python version
-set MIN_VER_MAJOR=3
-set MIN_VER_MINOR=12
-
-:: First check if Python is in PATH
-python --version >nul 2>&1
-if %errorlevel% equ 0 (
-    for /f "tokens=2 delims=." %%V in ('python -c "import sys; print(sys.version.split()[0])"') do (
-        set PYTHON_VER=%%V
-        if !PYTHON_VER! GEQ %MIN_VER_MINOR% (
-            set "PYTHON_PATH=python"
-            echo Found Python in PATH
-            goto :python_found
-        )
-    )
+:: Check for admin privileges
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo This script requires administrator privileges.
+    echo Please run this script as administrator.
+    pause
+    exit /b 1
 )
 
-:: Check common Python installation paths if not found in PATH
-set PYTHON_PATHS=^
-    "C:\Python313\python.exe" ^
-    "C:\Program Files\Python313\python.exe" ^
-    "C:\Program Files (x86)\Python313\python.exe" ^
-    "C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe" ^
-    "C:\Python312\python.exe" ^
-    "C:\Program Files\Python312\python.exe" ^
-    "C:\Program Files (x86)\Python312\python.exe" ^
-    "C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python312\python.exe"
-
-:: Try to find existing Python installation
-for %%p in (%PYTHON_PATHS%) do (
-    if exist %%p (
-        set "PYTHON_PATH=%%p"
-        echo Found Python at: !PYTHON_PATH!
-        goto :python_found
-    )
+:: Check Python version
+echo Checking Python version...
+where python >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Python is not installed or not in PATH
+    echo Please install Python and try again
+    pause
+    exit /b 1
 )
 
-:python_not_found
-echo No suitable Python installation found. Installing Python %MIN_VER_MAJOR%.%MIN_VER_MINOR%...
-curl -o python_installer.exe https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe
+for /f "tokens=*" %%i in ('python -c "import sys; print(sys.executable)"') do set PYTHON_PATH=%%i
 
-echo Installing Python %MIN_VER_MAJOR%.%MIN_VER_MINOR%...
-start /wait python_installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_pip=1
+:: Check dependencies
+echo Checking dependencies...
 
-echo Cleaning up...
-del python_installer.exe
+:: Check Node.js and npm
+where node >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Node.js is not installed or not in PATH
+    echo Please install Node.js and try again
+    pause
+    exit /b 1
+)
 
-echo Python installation completed!
-echo Waiting for installation to complete...
-timeout /t 10 /nobreak
+for /f "tokens=*" %%i in ('node -v') do set NODE_VERSION=%%i
+for /f "tokens=*" %%i in ('npm -v') do set NPM_VERSION=%%i
+echo Node.js !NODE_VERSION! with npm !NPM_VERSION! is installed
 
-:: Set default Python path after installation
-set "PYTHON_PATH=C:\Program Files\Python312\python.exe"
+:: Add npm global path to PATH
+for /f "tokens=*" %%i in ('npm config get prefix') do set NPM_PREFIX=%%i
+set "PATH=%NPM_PREFIX%;%PATH%"
 
-:python_found
-echo Installing required Python packages...
-"%PYTHON_PATH%" -m pip install --upgrade pip
-"%PYTHON_PATH%" -m pip install pywin32 pyinstaller
+:: Ensure pnpm is installed globally
+where pnpm >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Installing pnpm globally...
+    npm install -g pnpm
+)
 
-echo Python setup completed successfully.
+:: Get pnpm version
+for /f "tokens=*" %%i in ('pnpm -v') do set PNPM_VERSION=%%i
+echo pnpm version !PNPM_VERSION! is installed
+
+:: Check git
+where git >nul 2>nul
+if %errorlevel% neq 0 (
+    echo git is not installed or not in PATH
+    echo Please install git and try again
+    pause
+    exit /b 1
+)
+
+for /f "tokens=*" %%i in ('git --version') do set GIT_VERSION=%%i
+echo !GIT_VERSION! is installed
+
+echo All dependencies are satisfied
+
+:: Get the directory of this batch file
+set "SCRIPT_DIR=%~dp0"
+
+:: Run the Python script with full environment
 echo Running Decky Loader installer...
-"%PYTHON_PATH%" decky_builder.py
+"%PYTHON_PATH%" "%SCRIPT_DIR%decky_builder.py"
+
+if errorlevel 1 (
+    echo Error during build process: %ERRORLEVEL%
+    :: Clean up any remaining processes
+    taskkill /F /IM python.exe /T >nul 2>&1
+    taskkill /F /IM node.exe /T >nul 2>&1
+    exit /b %ERRORLEVEL%
+)
+
+:: Clean up any remaining processes
+taskkill /F /IM python.exe /T >nul 2>&1
+taskkill /F /IM node.exe /T >nul 2>&1
+
+echo Build completed successfully.
 pause
