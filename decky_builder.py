@@ -6,15 +6,18 @@ from pathlib import Path
 import sys
 import time
 import PyInstaller
+import atexit
 
 class DeckyBuilder:
     def __init__(self, release: str):
         self.release = release
-        self.root_dir = Path(__file__).parent
+        self.root_dir = Path(__file__).resolve().parent
         self.app_dir = self.root_dir / "app"
         self.src_dir = self.root_dir / "src"
         self.dist_dir = self.root_dir / "dist"
         self.homebrew_dir = self.dist_dir / "homebrew"
+        self.temp_files = []  # Track temporary files for cleanup
+        atexit.register(self.cleanup)  # Register cleanup on exit
         
         # Setup user homebrew directory
         self.user_home = Path.home()
@@ -27,6 +30,39 @@ class DeckyBuilder:
             "settings",
             "themes"
         ]
+
+    def cleanup(self):
+        """Clean up temporary files and directories"""
+        try:
+            # Clean up any temporary files we created
+            for temp_file in self.temp_files:
+                if os.path.exists(temp_file):
+                    try:
+                        if os.path.isfile(temp_file):
+                            os.remove(temp_file)
+                        elif os.path.isdir(temp_file):
+                            shutil.rmtree(temp_file, ignore_errors=True)
+                    except Exception as e:
+                        print(f"Warning: Failed to remove temporary file {temp_file}: {e}")
+
+            # Clean up PyInstaller temp files
+            for dir_name in ['build', 'dist']:
+                dir_path = self.root_dir / dir_name
+                if dir_path.exists():
+                    try:
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                    except Exception as e:
+                        print(f"Warning: Failed to remove {dir_name} directory: {e}")
+
+            # Clean up PyInstaller spec files
+            for spec_file in self.root_dir.glob("*.spec"):
+                try:
+                    os.remove(spec_file)
+                except Exception as e:
+                    print(f"Warning: Failed to remove spec file {spec_file}: {e}")
+
+        except Exception as e:
+            print(f"Warning: Error during cleanup: {e}")
 
     def safe_remove_directory(self, path):
         """Safely remove a directory with retries for Windows"""
@@ -117,23 +153,48 @@ class DeckyBuilder:
     def build_frontend(self):
         """Build frontend files"""
         print("Building frontend...")
+        batch_file = None
+        original_dir = os.getcwd()
+        
         try:
             frontend_dir = self.app_dir / "frontend"
+            if not frontend_dir.exists():
+                raise Exception(f"Frontend directory not found at {frontend_dir}")
+
+            print(f"Changing to frontend directory: {frontend_dir}")
             os.chdir(frontend_dir)
 
             # Create .loader.version file with the release tag
-            with open(".loader.version", "w") as f:
+            version_file = frontend_dir / ".loader.version"
+            with open(version_file, "w") as f:
                 f.write(self.release)
+            self.temp_files.append(str(version_file))
 
-            # Install dependencies and build
-            subprocess.run(["pnpm", "i"], check=True)
-            subprocess.run(["pnpm", "run", "build"], check=True)
+            # Create a batch file to run the commands
+            batch_file = frontend_dir / "build_frontend.bat"
+            with open(batch_file, "w") as f:
+                f.write("@echo off\n")
+                f.write("call pnpm install\n")
+                f.write("if %errorlevel% neq 0 exit /b %errorlevel%\n")
+                f.write("call pnpm run build\n")
+                f.write("if %errorlevel% neq 0 exit /b %errorlevel%\n")
+            self.temp_files.append(str(batch_file))
 
-            # Return to original directory
-            os.chdir(self.root_dir)
+            print("Running build commands...")
+            result = subprocess.run([str(batch_file)], check=True, capture_output=True, text=True, shell=True)
+            print(result.stdout)
+
+        except subprocess.CalledProcessError as e:
+            print(f"Command failed: {e.cmd}")
+            print(f"Output: {e.output}")
+            print(f"Error: {e.stderr}")
+            raise Exception(f"Error building frontend: Command failed - {str(e)}")
         except Exception as e:
             print(f"Error building frontend: {str(e)}")
             raise
+        finally:
+            # Always return to original directory
+            os.chdir(original_dir)
 
     def prepare_backend(self):
         """Prepare backend files for building."""
@@ -187,15 +248,33 @@ class DeckyBuilder:
             
             if requirements_file.exists():
                 subprocess.run([
-                    "pip", "install", "-r", str(requirements_file)
+                    sys.executable, "-m", "pip", "install", "--user", "-r", str(requirements_file)
                 ], check=True)
             elif pyproject_file.exists():
-                subprocess.run([
-                    "pip", "install", "poetry"
-                ], check=True)
-                subprocess.run([
-                    "poetry", "install"
-                ], cwd=self.app_dir / "backend", check=True)
+                # Install core dependencies directly instead of using poetry
+                dependencies = [
+                    "aiohttp>=3.8.1",
+                    "psutil>=5.9.0",
+                    "fastapi>=0.78.0",
+                    "uvicorn>=0.17.6",
+                    "python-multipart>=0.0.5",
+                    "watchdog>=2.1.7",
+                    "requests>=2.27.1",
+                    "setuptools>=60.0.0",
+                    "wheel>=0.37.1",
+                    "winregistry>=1.1.1; platform_system == 'Windows'",
+                    "pywin32>=303; platform_system == 'Windows'"
+                ]
+                
+                # Install each dependency
+                for dep in dependencies:
+                    try:
+                        subprocess.run([
+                            sys.executable, "-m", "pip", "install", "--user", dep
+                        ], check=True)
+                    except subprocess.CalledProcessError as e:
+                        print(f"Warning: Failed to install {dep}: {str(e)}")
+                        continue
             else:
                 print("Warning: No requirements.txt or pyproject.toml found")
         except Exception as e:
@@ -293,6 +372,30 @@ class DeckyBuilder:
         """Install Node.js v18.18.0 with npm"""
         print("Installing Node.js v18.18.0...")
         try:
+            # First check if Node.js v18.18.0 is already installed in common locations
+            nodejs_paths = [
+                r"C:\Program Files\nodejs\node.exe",
+                r"C:\Program Files (x86)\nodejs\node.exe",
+                os.path.expandvars(r"%APPDATA%\Local\Programs\nodejs\node.exe")
+            ]
+
+            # Try to use existing Node.js 18.18.0 first
+            for node_path in nodejs_paths:
+                if os.path.exists(node_path):
+                    try:
+                        version = subprocess.run([node_path, "--version"], capture_output=True, text=True).stdout.strip()
+                        if version.startswith("v18.18.0"):
+                            print(f"Found Node.js {version} at {node_path}")
+                            node_dir = os.path.dirname(node_path)
+                            if node_dir not in os.environ["PATH"]:
+                                os.environ["PATH"] = node_dir + os.pathsep + os.environ["PATH"]
+                            return True
+                    except:
+                        continue
+
+            # If we get here, we need to install Node.js 18.18.0
+            print("Installing Node.js v18.18.0...")
+            
             # Create temp directory for downloads
             temp_dir = self.root_dir / "temp"
             temp_dir.mkdir(exist_ok=True)
@@ -309,107 +412,59 @@ class DeckyBuilder:
                     )
                 except Exception as e:
                     print(f"Error downloading Node.js installer: {str(e)}")
-                    print("Please download Node.js v18.18.0 manually from: https://nodejs.org/dist/v18.18.0/node-v18.18.0-x64.msi")
-                    print("Then place it in the following directory:", temp_dir)
-                    input("Press Enter to continue once you've downloaded the installer...")
+                    raise
 
-            if not node_installer.exists():
-                raise Exception("Node.js installer not found. Please download it manually.")
-
-            # Install Node.js using interactive mode
+            # Install Node.js silently
             print("Installing Node.js (this may take a few minutes)...")
-            print("Please follow the installation wizard when it appears...")
-            install_process = subprocess.run(
-                ["msiexec", "/i", str(node_installer)],
-                check=True
-            )
-            
-            print("Waiting for Node.js installation to complete...")
-            time.sleep(10)
-            
-            # Set environment variables for the current process
-            nodejs_paths = [
-                r"C:\Program Files\nodejs",
-                os.path.join(os.environ["APPDATA"], "npm")
-            ]
-            
-            for nodejs_path in nodejs_paths:
+            try:
+                # First try to uninstall any existing Node.js using PowerShell
+                uninstall_cmd = 'Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Node.js*" } | ForEach-Object { $_.Uninstall() }'
+                subprocess.run(["powershell", "-Command", uninstall_cmd], capture_output=True, timeout=60)
+                
+                # Wait a bit for uninstallation to complete
+                time.sleep(5)
+                
+                # Now install Node.js 18.18.0
+                subprocess.run(
+                    ["msiexec", "/i", str(node_installer), "/qn", "ADDLOCAL=ALL"],
+                    check=True,
+                    timeout=300  # 5 minute timeout
+                )
+                
+                print("Waiting for Node.js installation to complete...")
+                time.sleep(10)
+                
+                # Add to PATH
+                nodejs_path = r"C:\Program Files\nodejs"
+                npm_path = os.path.join(os.environ["APPDATA"], "npm")
+                
+                # Update PATH for current process
                 if nodejs_path not in os.environ["PATH"]:
                     os.environ["PATH"] = nodejs_path + os.pathsep + os.environ["PATH"]
-
-            # Verify installation
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    node_version = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True).stdout.strip()
-                    npm_version = subprocess.run(["npm", "--version"], capture_output=True, text=True, check=True).stdout.strip()
-                    print(f"Successfully installed Node.js {node_version} with npm {npm_version}")
-                    break
-                except subprocess.CalledProcessError as e:
-                    if attempt == max_retries - 1:
-                        print("Warning: Node.js installation completed but verification failed")
-                        print(f"Error: {str(e)}")
-                        print("You may need to restart your system for the changes to take effect")
-                        print("After restarting, run this script again")
-                        raise Exception("Node.js verification failed")
-                    else:
-                        print(f"Waiting for Node.js to be available (attempt {attempt + 1}/{max_retries})...")
-                        time.sleep(5)
-            
-            # Clean up
-            self.safe_remove_directory(temp_dir)
+                if npm_path not in os.environ["PATH"]:
+                    os.environ["PATH"] = npm_path + os.pathsep + os.environ["PATH"]
+                
+                # Verify installation
+                node_version = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True).stdout.strip()
+                if not node_version.startswith("v18.18.0"):
+                    raise Exception(f"Wrong Node.js version installed: {node_version}")
+                
+                npm_version = subprocess.run(["npm", "--version"], capture_output=True, text=True, check=True).stdout.strip()
+                print(f"Successfully installed Node.js {node_version} with npm {npm_version}")
+                
+                # Clean up
+                self.safe_remove_directory(temp_dir)
+                return True
+                
+            except subprocess.TimeoutExpired:
+                print("Installation timed out. Please try installing Node.js v18.18.0 manually.")
+                raise
+            except Exception as e:
+                print(f"Installation failed: {str(e)}")
+                raise
             
         except Exception as e:
             print(f"Error installing Node.js: {str(e)}")
-            raise
-
-    def check_dependencies(self):
-        """Check and install required dependencies"""
-        print("Checking dependencies...")
-        try:
-            # Check Node.js and npm first
-            node_installed = False
-            try:
-                # Use shell=True to find node in PATH
-                node_version = subprocess.run("node --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                npm_version = subprocess.run("npm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                
-                # Check if version meets requirements
-                if not node_version.startswith("v18."):
-                    print(f"Node.js {node_version} found, but v18.18.0 is required")
-                    self.install_nodejs()
-                else:
-                    print(f"Node.js {node_version} with npm {npm_version} is installed")
-                    node_installed = True
-
-            except Exception as e:
-                print(f"Node.js/npm not found or error: {str(e)}")
-                self.install_nodejs()
-                node_installed = True  # If we get here, Node.js was installed successfully
-
-            if not node_installed:
-                raise Exception("Failed to install Node.js")
-
-            # Install pnpm globally if not present
-            try:
-                pnpm_version = subprocess.run("pnpm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                print(f"pnpm version {pnpm_version} is installed")
-            except:
-                print("Installing pnpm globally...")
-                subprocess.run("npm i -g pnpm", shell=True, check=True)
-                pnpm_version = subprocess.run("pnpm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                print(f"Installed pnpm version {pnpm_version}")
-
-            # Check git
-            try:
-                git_version = subprocess.run("git --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
-                print(f"{git_version} is installed")
-            except:
-                raise Exception("git is not installed. Please install git from https://git-scm.com/downloads")
-
-            print("All dependencies are satisfied")
-        except Exception as e:
-            print(f"Error checking dependencies: {str(e)}")
             raise
 
     def setup_steam_config(self):
@@ -482,10 +537,60 @@ class DeckyBuilder:
             print(f"Error setting up autostart: {str(e)}")
             return False
 
+    def check_python_version(self):
+        """Check if correct Python version is being used"""
+        print("Checking Python version...")
+        if sys.version_info.major != 3 or sys.version_info.minor != 11:
+            raise Exception("This script requires Python 3.11. Please run using decky_builder.bat")
+
+    def check_dependencies(self):
+        """Check and install required dependencies"""
+        print("Checking dependencies...")
+        try:
+            # Check Node.js and npm first
+            try:
+                # Use shell=True to find node in PATH
+                node_version = subprocess.run("node --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
+                npm_version = subprocess.run("npm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
+                
+                # Check if version meets requirements
+                if not node_version.startswith("v18."):
+                    print(f"Node.js {node_version} found, but v18.18.0 is required")
+                    self.install_nodejs()
+                else:
+                    print(f"Node.js {node_version} with npm {npm_version} is installed")
+
+            except Exception as e:
+                print(f"Node.js/npm not found or error: {str(e)}")
+                self.install_nodejs()
+
+            # Install pnpm globally if not present
+            try:
+                pnpm_version = subprocess.run("pnpm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
+                print(f"pnpm version {pnpm_version} is installed")
+            except:
+                print("Installing pnpm globally...")
+                subprocess.run("npm i -g pnpm", shell=True, check=True)
+                pnpm_version = subprocess.run("pnpm --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
+                print(f"Installed pnpm version {pnpm_version}")
+
+            # Check git
+            try:
+                git_version = subprocess.run("git --version", shell=True, check=True, capture_output=True, text=True).stdout.strip()
+                print(f"{git_version} is installed")
+            except:
+                raise Exception("git is not installed. Please install git from https://git-scm.com/downloads")
+
+            print("All dependencies are satisfied")
+        except Exception as e:
+            print(f"Error checking dependencies: {str(e)}")
+            raise
+
     def run(self):
         """Run the build process"""
         try:
             print("Starting Decky Loader build process...")
+            self.check_python_version()
             self.check_dependencies()
             self.setup_directories()
             self.clone_repository()
