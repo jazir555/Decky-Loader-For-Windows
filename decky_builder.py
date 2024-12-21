@@ -7,10 +7,13 @@ import sys
 import time
 import PyInstaller
 import atexit
+import requests
+import psutil
+import re
 
 class DeckyBuilder:
-    def __init__(self, release: str):
-        self.release = release
+    def __init__(self, release: str = None):
+        self.release = release or self.prompt_for_version()
         self.root_dir = Path(__file__).resolve().parent
         self.app_dir = self.root_dir / "app"
         self.src_dir = self.root_dir / "src"
@@ -126,29 +129,73 @@ class DeckyBuilder:
                     folder_path.mkdir(parents=True)
 
     def clone_repository(self):
-        """Clone Decky Loader repository"""
-        print("Cloning repository with release", self.release)
+        """Clone Decky Loader repository and checkout specific version"""
+        print(f"\nCloning Decky Loader repository version: {self.release}")
+        
+        # Clean up existing directory
         if os.path.exists(self.app_dir):
-            shutil.rmtree(self.app_dir)
+            print("Removing existing repository...")
+            self.safe_remove_directory(self.app_dir)
         
-        # Clone the repository
-        subprocess.run(['git', 'clone', 'https://github.com/SteamDeckHomebrew/decky-loader.git', self.app_dir], check=True)
-        os.chdir(self.app_dir)
-        
-        # If release is 'main', try to get the latest tag
-        if self.release == 'main':
+        try:
+            # Clone the repository
+            subprocess.run([
+                'git', 'clone', '--no-checkout',  # Don't checkout anything yet
+                'https://github.com/SteamDeckHomebrew/decky-loader.git',
+                str(self.app_dir)
+            ], check=True)
+            
+            os.chdir(self.app_dir)
+            
+            # Fetch all refs
+            subprocess.run(['git', 'fetch', '--all', '--tags'], check=True)
+            
+            # Try to checkout the exact version first
             try:
-                # Get the latest tag
-                result = subprocess.run(['git', 'describe', '--tags', '--abbrev=0'], 
-                                     capture_output=True, text=True, check=True)
-                self.release = result.stdout.strip()
-                print(f"Using latest tag: {self.release}")
+                subprocess.run(['git', 'checkout', self.release], check=True)
             except subprocess.CalledProcessError:
-                print("Warning: Could not get latest tag, using 'main'")
-        
-        # Checkout the specified release
-        subprocess.run(['git', 'checkout', self.release], check=True)
-        os.chdir(self.root_dir)
+                # If exact version fails, try to find the commit for pre-releases
+                if '-pre' in self.release:
+                    # Get all tags and their commit hashes
+                    result = subprocess.run(
+                        ['git', 'ls-remote', '--tags', 'origin'],
+                        capture_output=True, text=True, check=True
+                    )
+                    
+                    # Find the commit hash for our version
+                    for line in result.stdout.splitlines():
+                        commit_hash, ref = line.split('\t')
+                        ref = ref.replace('refs/tags/', '')
+                        ref = ref.replace('^{}', '')  # Remove annotated tag suffix
+                        if ref == self.release:
+                            print(f"Found commit {commit_hash} for version {self.release}")
+                            subprocess.run(['git', 'checkout', commit_hash], check=True)
+                            break
+                    else:
+                        raise Exception(f"Could not find commit for version {self.release}")
+                else:
+                    raise
+            
+            print(f"Successfully checked out version: {self.release}")
+            
+            # Create version files in key locations with the requested version
+            version_files = [
+                '.loader.version',
+                'frontend/.loader.version',
+                'backend/.loader.version',
+                'backend/decky_loader/.loader.version'
+            ]
+            
+            for version_file in version_files:
+                file_path = os.path.join(self.app_dir, version_file)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, 'w') as f:
+                    f.write(self.release)  # Use the requested version
+            
+        except subprocess.CalledProcessError as e:
+            raise Exception(f"Failed to clone/checkout repository: {str(e)}")
+        finally:
+            os.chdir(self.root_dir)
 
     def build_frontend(self):
         """Build frontend files"""
@@ -229,11 +276,10 @@ class DeckyBuilder:
         shutil.copy2(os.path.join(self.app_dir, "backend", "main.py"),
                     os.path.join(self.src_dir, "main.py"))
 
-        # Create .loader.version file in src/dist
-        print("Creating .loader.version...")
-        os.makedirs(os.path.join(self.src_dir, "dist"), exist_ok=True)
-        shutil.copy2(os.path.join(self.app_dir, "frontend", ".loader.version"),
-                    os.path.join(self.src_dir, "dist", ".loader.version"))
+        # Create version file in the src directory
+        version_file = os.path.join(self.src_dir, ".loader.version")
+        with open(version_file, "w") as f:
+            f.write(self.release)
 
         print("Backend preparation completed successfully!")
         return True
@@ -281,92 +327,168 @@ class DeckyBuilder:
             print(f"Error installing requirements: {str(e)}")
             raise
 
+    def add_defender_exclusion(self, path):
+        """Add Windows Defender exclusion for a path"""
+        try:
+            subprocess.run([
+                "powershell",
+                "-Command",
+                f"Add-MpPreference -ExclusionPath '{path}'"
+            ], check=True, capture_output=True)
+            return True
+        except:
+            print("Warning: Could not add Windows Defender exclusion. You may need to run as administrator or manually add an exclusion.")
+            return False
+
+    def remove_defender_exclusion(self, path):
+        """Remove Windows Defender exclusion for a path"""
+        try:
+            subprocess.run([
+                "powershell",
+                "-Command",
+                f"Remove-MpPreference -ExclusionPath '{path}'"
+            ], check=True, capture_output=True)
+        except:
+            print("Warning: Could not remove Windows Defender exclusion.")
+
     def build_executables(self):
         """Build executables using PyInstaller"""
-        print("Building executables...")
+        print("\nBuilding executables...")
+        
+        # Read version from .loader.version
+        version_file = os.path.join(self.app_dir, '.loader.version')
+        if not os.path.exists(version_file):
+            raise Exception("Version file not found. Run clone_repository first.")
+            
+        with open(version_file, 'r') as f:
+            version = f.read().strip()
+            
+        # Normalize version for Python packaging
+        # Convert v3.0.5-pre1 to 3.0.5rc1
+        py_version = version.lstrip('v')  # Remove v prefix
+        if '-pre' in py_version:
+            py_version = py_version.replace('-pre', 'rc')
+            
+        print(f"Building version: {version} (Python package version: {py_version})")
+        
+        original_dir = os.getcwd()
+        backend_dir = os.path.join(self.app_dir, "backend")
+        dist_dir = os.path.join(backend_dir, "dist")
+        
+        # Add Windows Defender exclusion for build directories
+        added_exclusion = self.add_defender_exclusion(backend_dir)
+        
         try:
-            # Clean services directory first
-            services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
-            if os.path.exists(services_dir):
-                for item in os.listdir(services_dir):
-                    item_path = os.path.join(services_dir, item)
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                    elif os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-
-            # Build console version
-            subprocess.run([
-                'pyinstaller',
-                '--clean',
-                '--name', 'PluginLoader',
-                '--onefile',
-                '--console',
-                '--add-data', 'decky_loader/static;decky_loader/static',
-                '--add-data', 'decky_loader/locales;decky_loader/locales',
-                '--add-data', 'src/legacy;src/legacy',
-                '--add-data', 'decky_loader/plugin;decky_loader/plugin',
-                '--hidden-import', 'logging.handlers',
-                '--hidden-import', 'sqlite3',
-                'main.py'
-            ], check=True, cwd=self.src_dir)
-
-            # Build no-console version
-            subprocess.run([
-                'pyinstaller',
-                '--clean',
-                '--name', 'PluginLoader_noconsole',
-                '--onefile',
-                '--noconsole',
-                '--add-data', 'decky_loader/static;decky_loader/static',
-                '--add-data', 'decky_loader/locales;decky_loader/locales',
-                '--add-data', 'src/legacy;src/legacy',
-                '--add-data', 'decky_loader/plugin;decky_loader/plugin',
-                '--hidden-import', 'logging.handlers',
-                '--hidden-import', 'sqlite3',
-                'main.py'
-            ], check=True, cwd=self.src_dir)
-
-            # Create required directories
-            services_dir = os.path.join(os.path.expanduser("~"), "homebrew", "services")
-            logs_dir = os.path.join(os.path.expanduser("~"), "homebrew", "logs")
-            os.makedirs(services_dir, exist_ok=True)
-            os.makedirs(logs_dir, exist_ok=True)
-
-            # Copy executables to homebrew directory
-            print("Copying executables to homebrew directory...")
-            shutil.copy2(
-                os.path.join(self.src_dir, "dist", "PluginLoader.exe"),
-                os.path.join(services_dir, "plugin_loader.exe")
+            os.chdir(backend_dir)
+            
+            # Create setup.py with the correct version
+            setup_py = """
+            from setuptools import setup, find_packages
+            
+            setup(
+                name="decky_loader",
+                version="%s",
+                packages=find_packages(),
+                package_data={
+                    'decky_loader': [
+                        'locales/*',
+                        'static/*',
+                        '.loader.version'
+                    ],
+                },
+                install_requires=[
+                    'aiohttp>=3.8.1',
+                    'certifi>=2022.6.15',
+                    'packaging>=21.3',
+                    'psutil>=5.9.1',
+                    'requests>=2.28.1',
+                ],
             )
-            shutil.copy2(
-                os.path.join(self.src_dir, "dist", "PluginLoader_noconsole.exe"),
-                os.path.join(services_dir, "PluginLoader_noconsole.exe")
-            )
+            """ % py_version
 
-            # Create version file
+            with open("setup.py", "w") as f:
+                f.write(setup_py)
+                
+            # Install the package in development mode
+            subprocess.run([sys.executable, "-m", "pip", "install", "-e", "."], check=True)
+            
+            # Common PyInstaller arguments
+            pyinstaller_args = [
+                sys.executable,
+                "-m",
+                "PyInstaller",
+                "--clean",
+                "--noconfirm",
+                "pyinstaller.spec"
+            ]
+            
+            # First build console version
+            print("Building PluginLoader.exe (console version)...")
+            os.environ.pop('DECKY_NOCONSOLE', None)  # Ensure env var is not set
+            subprocess.run(pyinstaller_args, check=True)
+            
+            # Then build no-console version
+            print("Building PluginLoader_noconsole.exe...")
+            os.environ['DECKY_NOCONSOLE'] = '1'
+            subprocess.run(pyinstaller_args, check=True)
+            
+            # Clean up environment
+            os.environ.pop('DECKY_NOCONSOLE', None)
+            
+            # Copy the built executables to dist
+            os.makedirs(os.path.join(self.root_dir, "dist"), exist_ok=True)
+            if os.path.exists(os.path.join("dist", "PluginLoader.exe")):
+                shutil.copy2(
+                    os.path.join("dist", "PluginLoader.exe"),
+                    os.path.join(self.root_dir, "dist", "PluginLoader.exe")
+                )
+            else:
+                raise Exception("PluginLoader.exe not found after build")
+                
+            if os.path.exists(os.path.join("dist", "PluginLoader_noconsole.exe")):
+                shutil.copy2(
+                    os.path.join("dist", "PluginLoader_noconsole.exe"),
+                    os.path.join(self.root_dir, "dist", "PluginLoader_noconsole.exe")
+                )
+            else:
+                raise Exception("PluginLoader_noconsole.exe not found after build")
+                
+            print("Successfully built executables")
+            
+        except subprocess.CalledProcessError as e:
+            raise Exception(f"Failed to build executables: {str(e)}")
+        finally:
+            if added_exclusion:
+                self.remove_defender_exclusion(backend_dir)
+            os.chdir(original_dir)
+
+    def install_files(self):
+        """Install files to homebrew directory"""
+        print("\nInstalling files to homebrew directory...")
+        
+        # Create homebrew directory if it doesn't exist
+        homebrew_dir = os.path.join(os.path.expanduser("~"), "homebrew")
+        services_dir = os.path.join(homebrew_dir, "services")
+        os.makedirs(services_dir, exist_ok=True)
+        
+        try:
+            # Copy PluginLoader.exe and PluginLoader_noconsole.exe
+            for exe_name in ["PluginLoader.exe", "PluginLoader_noconsole.exe"]:
+                exe_source = os.path.join(self.root_dir, "dist", exe_name)
+                exe_dest = os.path.join(services_dir, exe_name)
+                if not os.path.exists(exe_source):
+                    raise Exception(f"{exe_name} not found at {exe_source}")
+                shutil.copy2(exe_source, exe_dest)
+            
+            # Create .loader.version file
             version_file = os.path.join(services_dir, ".loader.version")
             with open(version_file, "w") as f:
                 f.write(self.release)
-
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error during build process: {e}")
-            return False
-
-    def copy_to_homebrew(self):
-        """Copy all necessary files to the homebrew directory"""
-        print("Copying files to homebrew directory...")
-        try:
-            # Create homebrew directory if it doesn't exist
-            os.makedirs(self.homebrew_dir, exist_ok=True)
-
-            # We don't need to copy anything else since build_executables handles the file copying
-            pass
-
+            
+            print("Successfully installed files")
+            
         except Exception as e:
-            print(f"Error during copy to homebrew: {str(e)}")
-            raise
+            raise Exception(f"Failed to copy files to homebrew: {str(e)}")
 
     def install_nodejs(self):
         """Install Node.js v18.18.0 with npm"""
@@ -586,8 +708,84 @@ class DeckyBuilder:
             print(f"Error checking dependencies: {str(e)}")
             raise
 
+    def get_release_versions(self):
+        """Get list of available release versions"""
+        print("Fetching available versions...")
+        try:
+            response = requests.get(
+                "https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases"
+            )
+            response.raise_for_status()
+            releases = response.json()
+            
+            # Split releases into stable and pre-release
+            stable_releases = []
+            pre_releases = []
+            
+            for release in releases:
+                version = release['tag_name']
+                if release['prerelease']:
+                    pre_releases.append(version)
+                else:
+                    stable_releases.append(version)
+            
+            # Sort versions and take only the latest 3 of each
+            stable_releases.sort(reverse=True)
+            pre_releases.sort(reverse=True)
+            
+            stable_releases = stable_releases[:3]
+            pre_releases = pre_releases[:3]
+            
+            # Combine and sort all versions
+            all_versions = stable_releases + pre_releases
+            all_versions.sort(reverse=True)
+            
+            return all_versions
+            
+        except requests.RequestException as e:
+            raise Exception(f"Failed to fetch release versions: {str(e)}")
+
+    def prompt_for_version(self):
+        """Prompt the user to select a version to install."""
+        versions = self.get_release_versions()
+        
+        print("\nAvailable versions:")
+        print("Stable versions:")
+        stable_count = 0
+        for i, version in enumerate(versions):
+            if '-pre' not in version:
+                print(f"{i+1}. {version}")
+                stable_count += 1
+        
+        print("\nPre-release versions:")
+        for i, version in enumerate(versions):
+            if '-pre' in version:
+                print(f"{i+1}. {version}")
+        
+        while True:
+            try:
+                choice = input("\nSelect a version (1-{}): ".format(len(versions)))
+                index = int(choice) - 1
+                if 0 <= index < len(versions):
+                    return versions[index]
+                print("Invalid selection, please try again.")
+            except ValueError:
+                print("Invalid input, please enter a number.")
+
+    def terminate_processes(self):
+        """Terminate running instances of executables that may interfere with the build."""
+        for proc in psutil.process_iter(['pid', 'name', 'exe']):
+            if proc.info['name'] in ['PluginLoader.exe', 'PluginLoader_noconsole.exe']:
+                try:
+                    proc.terminate()
+                    proc.wait()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+
     def run(self):
-        """Run the build process"""
+        """Run the build and installation process."""
+        # Terminate interfering processes
+        self.terminate_processes()
         try:
             print("Starting Decky Loader build process...")
             self.check_python_version()
@@ -599,10 +797,10 @@ class DeckyBuilder:
             self.prepare_backend()
             self.install_requirements()
             self.build_executables()
-            self.copy_to_homebrew()
+            self.install_files()
             self.setup_steam_config()
             self.setup_autostart()
-            print("\nBuild process completed successfully\!")
+            print("\nBuild process completed successfully!")
             print("\nNext steps:")
             print("1. Close Steam if it's running")
             print("2. Launch Steam using the new shortcut on your desktop")
@@ -616,8 +814,8 @@ class DeckyBuilder:
 
 def main():
     parser = argparse.ArgumentParser(description='Build and Install Decky Loader for Windows')
-    parser.add_argument('--release', required=False, default="main", 
-                      help='Release version/branch to build (default: main)')
+    parser.add_argument('--release', required=False, default=None, 
+                      help='Release version/branch to build (if not specified, will prompt for version)')
     args = parser.parse_args()
 
     try:
