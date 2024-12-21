@@ -611,6 +611,8 @@ class DeckyBuilder:
         except Exception as e:
             print(f"Error during build process: {str(e)}")
             raise
+        finally:
+            self.cleanup()
 
 def main():
     parser = argparse.ArgumentParser(description='Build and Install Decky Loader for Windows')
